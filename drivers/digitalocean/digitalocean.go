@@ -340,65 +340,100 @@ func (d *Driver) GetURL() (string, error) {
 	return fmt.Sprintf("tcp://%s", net.JoinHostPort(ip, "2376")), nil
 }
 
-func (d *Driver) GetState() (state.State, error) {
-	droplet, resp, err := d.getClient().Droplets.Get(context.TODO(), d.DropletID)
-	if err != nil {
-		if resp == nil || resp.StatusCode != http.StatusNotFound {
-			return state.Error, err
+func (d *Driver) GetState() (machineState state.State, err error) {
+	err = d.retryWithAlternativeCreds(func(client *godo.Client) error {
+		droplet, resp, err := d.getClient().Droplets.Get(context.TODO(), d.DropletID)
+		if err != nil {
+			if resp == nil || resp.StatusCode != http.StatusNotFound {
+				machineState = state.Error
+				return err
+			}
+			machineState = state.None
+			return fmt.Errorf("machine %v not found", d.MachineName)
 		}
-		return state.None, fmt.Errorf("machine %v not found", d.MachineName)
-	}
 
-	switch droplet.Status {
-	case "new":
-		return state.Starting, nil
-	case "active":
-		return state.Running, nil
-	case "off":
-		return state.Stopped, nil
-	}
-	return state.None, nil
+		switch droplet.Status {
+		case "new":
+			machineState = state.Starting
+		case "active":
+			machineState = state.Running
+		case "off":
+			machineState = state.Stopped
+		default:
+			machineState = state.None
+		}
+
+		return nil
+	})
 }
 
 func (d *Driver) Start() error {
-	_, _, err := d.getClient().DropletActions.PowerOn(context.TODO(), d.DropletID)
-	return err
+	return d.retryWithAlternativeCreds(func(client *godo.Client) error {
+		_, _, err := client.DropletActions.PowerOn(context.TODO(), d.DropletID)
+		return err
+	})
 }
 
 func (d *Driver) Stop() error {
-	_, _, err := d.getClient().DropletActions.Shutdown(context.TODO(), d.DropletID)
-	return err
+	return d.retryWithAlternativeCreds(func(client *godo.Client) error {
+		_, _, err := client.DropletActions.Shutdown(context.TODO(), d.DropletID)
+		return err
+	})
 }
 
 func (d *Driver) Restart() error {
-	_, _, err := d.getClient().DropletActions.Reboot(context.TODO(), d.DropletID)
-	return err
+	return d.retryWithAlternativeCreds(func(client *godo.Client) error {
+		_, _, err := client.DropletActions.Reboot(context.TODO(), d.DropletID)
+		return err
+	})
 }
 
 func (d *Driver) Kill() error {
-	_, _, err := d.getClient().DropletActions.PowerOff(context.TODO(), d.DropletID)
-	return err
+	return d.retryWithAlternativeCreds(func(client *godo.Client) error {
+		_, _, err := client.DropletActions.PowerOff(context.TODO(), d.DropletID)
+		return err
+	})
 }
 
 func (d *Driver) Remove() error {
-	client := d.getClient()
-	if d.SSHKeyFingerprint == "" && d.SSHKeyID != 0 {
-		if resp, err := client.Keys.DeleteByID(context.TODO(), d.SSHKeyID); err != nil {
-			if resp.StatusCode == 404 {
-				log.Infof("Digital Ocean SSH key doesn't exist, assuming it is already deleted")
+	return d.retryWithAlternativeCreds(func(client *godo.Client) error {
+		if d.SSHKeyFingerprint == "" && d.SSHKeyID != 0 {
+			if resp, err := client.Keys.DeleteByID(context.TODO(), d.SSHKeyID); err != nil {
+				if resp.StatusCode == 404 {
+					log.Infof("Digital Ocean SSH key doesn't exist, assuming it is already deleted")
+				} else {
+					return err
+				}
+			}
+		}
+		if resp, err := client.Droplets.Delete(context.TODO(), d.DropletID); err != nil {
+			if resp != nil && resp.StatusCode == 404 {
+				log.Infof("Digital Ocean droplet doesn't exist, assuming it is already deleted")
 			} else {
+				log.Errorf("ERROR: %v", err)
 				return err
 			}
 		}
-	}
-	if resp, err := client.Droplets.Delete(context.TODO(), d.DropletID); err != nil {
-		if resp != nil && resp.StatusCode == 404 {
-			log.Infof("Digital Ocean droplet doesn't exist, assuming it is already deleted")
-		} else {
-			log.Errorf("ERROR: %v", err)
-			return err
+		return nil
+	})
+}
+
+func (d *Driver) retryWithAlternativeCreds(fn func(client *godo.Client) error) error {
+	if originalErr := fn(d.getClient()); originalErr != nil {
+		if token := os.Getenv("DIGITALOCEAN_ACCESS_TOKEN"); token != "" && token != d.AccessToken {
+			d.AccessToken = token
+			if retryErr := fn(d.getClient()); retryErr != nil {
+				return fmt.Errorf(
+					"original error: %w. error from retry with credentials from env: %v",
+					originalErr,
+					retryErr,
+				)
+			}
 		}
+
+		return originalErr
 	}
+
 	return nil
 }
 
